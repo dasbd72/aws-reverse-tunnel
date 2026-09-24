@@ -29,6 +29,9 @@ aws-reverse-tunnel infra deploy
   - `--domain` is the base domain for your tunnel subdomains (e.g. `dasbd72.com`).
   - `--hosted-zone-id` is the Route53 hosted zone ID for that domain (auto-detected).
   - `--region` is the AWS region to deploy the stack in (auto-detected from your AWS CLI config).
+  - `--extra-port-range START-END` opens that TCP+UDP port range on the EC2 host and in
+    frps — needed before `frpc add --proto tcp|udp --remote-port` can use a port in that
+    range. Not opened at all unless given. Requires `infra deploy` to apply.
   - `--yes` skips confirmation prompts.
 
 Note the `ElasticIp` output (or run `aws-reverse-tunnel infra status` anytime).
@@ -47,6 +50,11 @@ aws-reverse-tunnel frpc add openwebui 192.168.50.10:8080
   - `--region` is the AWS region to deploy the stack in (auto-detected from your AWS CLI config).
   - `--token` is the frp auth token (fetched from SSM if this is the same machine that ran step 2).
 - `frpc add <name> <local-ip>:<local-port>` adds a new tunnel for the given local service.
+  - By default this exposes an HTTP(S) service at `<name>.<base-domain>`.
+  - For a non-HTTP service (e.g. WireGuard), pass `--proto tcp|udp --remote-port <port>`
+    to bind an explicit port on the frps server instead, e.g.
+    `frpc add wireguard 127.0.0.1:51820 --proto udp --remote-port 51820`. The port must
+    fall within the range set by `infra config --extra-port-range`.
 - `frpc list` lists all configured tunnels.
 - `frpc del <name>` removes a configured tunnel.
 

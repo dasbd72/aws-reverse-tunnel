@@ -1,3 +1,5 @@
+from typing import Any
+
 from aws_cdk import App, Stack
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_route53 as route53
@@ -6,7 +8,7 @@ from aws_cdk.assertions import Match, Template
 from aws_reverse_tunnel.infra.tunnel_stack import TunnelStack
 
 
-def _build_template() -> Template:
+def _build_template(**kwargs: Any) -> Template:
     app = App()
     fixtures = Stack(app, "Fixtures")
     vpc = ec2.Vpc.from_vpc_attributes(
@@ -31,6 +33,7 @@ def _build_template() -> Template:
         hosted_zone_id="Z0FAKEZONE",
         domain_name="dasbd72.com",
         frp_token="test-token",
+        **kwargs,
     )
     return Template.from_stack(stack)
 
@@ -173,3 +176,39 @@ def test_wildcard_dns_record_points_at_elastic_ip() -> None:
             "HostedZoneId": "Z0FAKEZONE",
         },
     )
+
+
+def test_no_extra_port_range_opened_by_default() -> None:
+    template = _build_template()
+
+    template.has_resource_properties(
+        "AWS::EC2::SecurityGroup",
+        {
+            "SecurityGroupIngress": Match.not_(
+                Match.array_with([Match.object_like({"FromPort": 20000})])
+            )
+        },
+    )
+
+
+def test_security_group_opens_extra_tcp_and_udp_port_range_when_configured() -> None:
+    template = _build_template(extra_port_range=(20000, 20100))
+
+    for protocol in ("tcp", "udp"):
+        template.has_resource_properties(
+            "AWS::EC2::SecurityGroup",
+            {
+                "SecurityGroupIngress": Match.array_with(
+                    [
+                        Match.object_like(
+                            {
+                                "CidrIp": "0.0.0.0/0",
+                                "IpProtocol": protocol,
+                                "FromPort": 20000,
+                                "ToPort": 20100,
+                            }
+                        )
+                    ]
+                )
+            },
+        )

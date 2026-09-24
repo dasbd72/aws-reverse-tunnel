@@ -2,6 +2,7 @@ import pytest
 
 from aws_reverse_tunnel.frpc_config import FrpcConfig
 from aws_reverse_tunnel.frpc_toml import parse_target, render
+from aws_reverse_tunnel.services import Service
 
 
 class TestParseTarget:
@@ -35,7 +36,7 @@ def test_renders_one_proxy_block_per_service() -> None:
     config = FrpcConfig(
         server_addr="1.2.3.4", base_domain="dasbd72.com", token="secret-token"
     )
-    services = {"openwebui": "192.168.50.10:8080"}
+    services = {"openwebui": Service(target="192.168.50.10:8080")}
 
     output = render(config, services)
 
@@ -61,8 +62,27 @@ def test_renders_services_in_sorted_order_for_determinism() -> None:
     config = FrpcConfig(
         server_addr="1.2.3.4", base_domain="dasbd72.com", token="secret-token"
     )
-    services = {"zeta": "10.0.0.1:1", "alpha": "10.0.0.2:2"}
+    services = {
+        "zeta": Service(target="10.0.0.1:1"),
+        "alpha": Service(target="10.0.0.2:2"),
+    }
 
     output = render(config, services)
 
     assert output.index('name = "alpha"') < output.index('name = "zeta"')
+
+
+@pytest.mark.parametrize("proto", ["tcp", "udp"])
+def test_renders_tcp_udp_proxy_with_remote_port(proto: str) -> None:
+    config = FrpcConfig(
+        server_addr="1.2.3.4", base_domain="dasbd72.com", token="secret-token"
+    )
+    services = {
+        "wireguard": Service(target="127.0.0.1:51820", proto=proto, remote_port=51820)
+    }
+
+    output = render(config, services)
+
+    assert f'type = "{proto}"' in output
+    assert "remotePort = 51820" in output
+    assert "customDomains" not in output

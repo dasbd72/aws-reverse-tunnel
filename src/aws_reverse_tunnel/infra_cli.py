@@ -73,18 +73,28 @@ def _run_cdk(subcommand: str, infra_config: InfraConfig) -> None:
     cdk = _require_cdk()
     _require_aws_cdk_lib()
     INFRA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    context_args = [
+        "-c",
+        f"domain={infra_config.domain}",
+        "-c",
+        f"hostedZoneId={infra_config.hosted_zone_id}",
+        "-c",
+        f"region={infra_config.region}",
+    ]
+    if infra_config.extra_port_range_start is not None:
+        context_args += [
+            "-c",
+            f"extraPortRangeStart={infra_config.extra_port_range_start}",
+            "-c",
+            f"extraPortRangeEnd={infra_config.extra_port_range_end}",
+        ]
     try:
         subprocess.run(
             [
                 cdk,
                 "-a",
                 f"{sys.executable} -m aws_reverse_tunnel.infra.app",
-                "-c",
-                f"domain={infra_config.domain}",
-                "-c",
-                f"hostedZoneId={infra_config.hosted_zone_id}",
-                "-c",
-                f"region={infra_config.region}",
+                *context_args,
                 subcommand,
             ],
             cwd=INFRA_CACHE_DIR,
@@ -94,6 +104,22 @@ def _run_cdk(subcommand: str, infra_config: InfraConfig) -> None:
         raise click.ClickException(
             f"cdk {subcommand} failed (exit code {exc.returncode})"
         ) from exc
+
+
+def _parse_port_range(value: str) -> tuple[int, int]:
+    start_str, sep, end_str = value.partition("-")
+    if not sep or not start_str.isdigit() or not end_str.isdigit():
+        raise click.BadParameter(
+            f"invalid --extra-port-range {value!r}; expected START-END",
+            param_hint="--extra-port-range",
+        )
+    start, end = int(start_str), int(end_str)
+    if not (1 <= start <= end <= 65535):
+        raise click.BadParameter(
+            f"invalid --extra-port-range {value!r}; expected 1 <= START <= END <= 65535",
+            param_hint="--extra-port-range",
+        )
+    return start, end
 
 
 @click.group()
@@ -118,12 +144,24 @@ def infra() -> None:
     help="Route53 hosted zone ID for --domain. Auto-discovered from --domain if not given.",
 )
 @click.option(
+    "--extra-port-range",
+    default=None,
+    metavar="START-END",
+    help="Open this TCP+UDP port range on the EC2 host and in frps, for "
+    "non-HTTP tunnels added via `frpc add --proto tcp|udp --remote-port`. "
+    "Not opened at all unless given.",
+)
+@click.option(
     "--yes",
     is_flag=True,
     help="Overwrite an existing configuration without confirming.",
 )
 def config(
-    domain: str, region: str | None, hosted_zone_id: str | None, yes: bool
+    domain: str,
+    region: str | None,
+    hosted_zone_id: str | None,
+    extra_port_range: str | None,
+    yes: bool,
 ) -> None:
     """Configure the domain/zone/region that deploy/destroy/diff/status target."""
     region = region or _default_region()
@@ -133,8 +171,13 @@ def config(
             "with `aws configure set region <region>`"
         )
     hosted_zone_id = hosted_zone_id or _discover_hosted_zone_id(domain, region)
+    port_range = _parse_port_range(extra_port_range) if extra_port_range else None
     new_config = InfraConfig(
-        domain=domain, hosted_zone_id=hosted_zone_id, region=region
+        domain=domain,
+        hosted_zone_id=hosted_zone_id,
+        region=region,
+        extra_port_range_start=port_range[0] if port_range else None,
+        extra_port_range_end=port_range[1] if port_range else None,
     )
 
     if INFRA_CONFIG_FILE.exists():

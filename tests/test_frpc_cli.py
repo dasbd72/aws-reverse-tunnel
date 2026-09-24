@@ -7,7 +7,7 @@ from click.testing import CliRunner
 from aws_reverse_tunnel import cli, frpc_cli
 from aws_reverse_tunnel.frpc_config import FrpcConfig
 from aws_reverse_tunnel.infra_config import InfraConfig
-from aws_reverse_tunnel.services import load_services
+from aws_reverse_tunnel.services import Service, load_services
 
 
 @pytest.fixture(autouse=True)
@@ -349,7 +349,7 @@ class TestConfigCommand:
 
         assert result.exit_code == 0, result.output
         assert load_services(frpc_cli.SERVICES_FILE) == {
-            "openwebui": "192.168.50.10:8080"
+            "openwebui": Service(target="192.168.50.10:8080")
         }
 
     def test_service_flags_replace_persisted_services(
@@ -364,7 +364,9 @@ class TestConfigCommand:
         )
 
         assert result.exit_code == 0, result.output
-        assert load_services(frpc_cli.SERVICES_FILE) == {"new": "192.168.50.10:2222"}
+        assert load_services(frpc_cli.SERVICES_FILE) == {
+            "new": Service(target="192.168.50.10:2222")
+        }
 
     def test_prompts_before_overwriting_changed_values(
         self, isolated_paths: Path, fake_collaborators: dict
@@ -543,6 +545,61 @@ class TestRenderCommand:
         assert 'name = "openwebui"' in result.output
         assert 'customDomains = ["openwebui.dasbd72.com"]' in result.output
 
+    def test_renders_udp_proxy_from_extended_service_flag(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli.main,
+            [
+                "frpc",
+                "render",
+                "--server-addr",
+                "1.2.3.4",
+                "--base-domain",
+                "dasbd72.com",
+                "--region",
+                "ap-northeast-1",
+                "--token",
+                "tok",
+                "--service",
+                "wireguard=127.0.0.1:51820/udp:51820",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert 'name = "wireguard"' in result.output
+        assert 'type = "udp"' in result.output
+        assert "remotePort = 51820" in result.output
+        assert "customDomains" not in result.output
+
+    def test_rejects_extended_service_flag_with_non_numeric_remote_port(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            cli.main,
+            [
+                "frpc",
+                "render",
+                "--server-addr",
+                "1.2.3.4",
+                "--base-domain",
+                "dasbd72.com",
+                "--region",
+                "ap-northeast-1",
+                "--token",
+                "tok",
+                "--service",
+                "wireguard=127.0.0.1:51820/udp:not-a-port",
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--service" in result.output
+
     def test_rejects_malformed_service_flag(
         self, isolated_paths: Path, fake_collaborators: dict
     ) -> None:
@@ -629,7 +686,9 @@ def test_add_registers_service_and_restarts(
     result = runner.invoke(cli.main, ["frpc", "add", "openwebui", "192.168.50.10:8080"])
 
     assert result.exit_code == 0, result.output
-    assert load_services(frpc_cli.SERVICES_FILE) == {"openwebui": "192.168.50.10:8080"}
+    assert load_services(frpc_cli.SERVICES_FILE) == {
+        "openwebui": Service(target="192.168.50.10:8080")
+    }
     assert (
         'customDomains = ["openwebui.dasbd72.com"]'
         in frpc_cli.FRPC_TOML_FILE.read_text()
@@ -649,6 +708,65 @@ def test_add_does_not_call_ssm(
     result = runner.invoke(cli.main, ["frpc", "add", "openwebui", "192.168.50.10:8080"])
 
     assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("proto", ["tcp", "udp"])
+def test_add_with_remote_port_creates_tcp_or_udp_proxy(
+    isolated_paths: Path, fake_collaborators: dict, proto: str
+) -> None:
+    runner = CliRunner()
+    runner.invoke(cli.main, _config_args())
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "frpc",
+            "add",
+            "wireguard",
+            "127.0.0.1:51820",
+            "--proto",
+            proto,
+            "--remote-port",
+            "51820",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert load_services(frpc_cli.SERVICES_FILE) == {
+        "wireguard": Service(target="127.0.0.1:51820", proto=proto, remote_port=51820)
+    }
+    toml_text = frpc_cli.FRPC_TOML_FILE.read_text()
+    assert f'type = "{proto}"' in toml_text
+    assert "remotePort = 51820" in toml_text
+
+
+def test_add_requires_remote_port_for_tcp_udp_proto(
+    isolated_paths: Path, fake_collaborators: dict
+) -> None:
+    runner = CliRunner()
+    runner.invoke(cli.main, _config_args())
+
+    result = runner.invoke(
+        cli.main, ["frpc", "add", "wireguard", "127.0.0.1:51820", "--proto", "udp"]
+    )
+
+    assert result.exit_code != 0
+    assert "remote_port" in result.output
+
+
+def test_add_rejects_remote_port_with_default_http_proto(
+    isolated_paths: Path, fake_collaborators: dict
+) -> None:
+    runner = CliRunner()
+    runner.invoke(cli.main, _config_args())
+
+    result = runner.invoke(
+        cli.main,
+        ["frpc", "add", "openwebui", "192.168.50.10:8080", "--remote-port", "8080"],
+    )
+
+    assert result.exit_code != 0
+    assert "remote_port" in result.output
 
 
 def test_del_errors_when_service_unknown(
@@ -698,6 +816,30 @@ def test_list_shows_configured_services(
     result = runner.invoke(cli.main, ["frpc", "list"])
 
     assert "openwebui.dasbd72.com -> 192.168.50.10:8080" in result.output
+
+
+def test_list_shows_remote_port_for_non_http_services(
+    isolated_paths: Path, fake_collaborators: dict
+) -> None:
+    runner = CliRunner()
+    runner.invoke(cli.main, _config_args())
+    runner.invoke(
+        cli.main,
+        [
+            "frpc",
+            "add",
+            "wireguard",
+            "127.0.0.1:51820",
+            "--proto",
+            "udp",
+            "--remote-port",
+            "51820",
+        ],
+    )
+
+    result = runner.invoke(cli.main, ["frpc", "list"])
+
+    assert "1.2.3.4:51820 (udp) -> 127.0.0.1:51820" in result.output
 
 
 def test_status_invokes_systemctl_status(

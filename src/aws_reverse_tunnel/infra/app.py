@@ -71,6 +71,14 @@ region = app.node.try_get_context("region")
 if not domain_name or not hosted_zone_id or not region:
     raise SystemExit("missing required CDK context: domain, hostedZoneId, region")
 
+extra_port_range_start = app.node.try_get_context("extraPortRangeStart")
+extra_port_range_end = app.node.try_get_context("extraPortRangeEnd")
+extra_port_range = (
+    (int(extra_port_range_start), int(extra_port_range_end))
+    if extra_port_range_start is not None
+    else None
+)
+
 TunnelStack(
     app,
     STACK_NAME,
@@ -78,6 +86,7 @@ TunnelStack(
     hosted_zone_id=hosted_zone_id,
     domain_name=domain_name,
     frp_token=_get_or_create_frp_token(),
+    extra_port_range=extra_port_range,
 )
 
 app.synth()

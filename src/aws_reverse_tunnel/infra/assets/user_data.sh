@@ -8,6 +8,7 @@ VHOST_HTTP_PORT="__VHOST_HTTP_PORT__"
 REGION="__REGION__"
 FRP_VERSION="__FRP_VERSION__"
 CADDY_VERSION="__CADDY_VERSION__"
+ALLOW_PORTS="__ALLOW_PORTS__"
 
 # t4g.nano has 0.5 GiB RAM and no swap by default, which isn't enough for
 # dnf/pip transactions on a fresh box (dnf gets OOM-killed without this).
@@ -35,6 +36,9 @@ auth.method = "token"
 auth.token = "${TOKEN}"
 vhostHTTPPort = ${VHOST_HTTP_PORT}
 EOF
+if [[ -n "${ALLOW_PORTS}" ]]; then
+  echo "${ALLOW_PORTS}" >> /opt/frp/frps.toml
+fi
 chmod 600 /opt/frp/frps.toml
 
 cat > /etc/systemd/system/frps.service <<'UNIT'

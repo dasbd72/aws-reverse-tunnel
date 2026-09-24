@@ -21,7 +21,7 @@ from .paths import (
     SYSTEMD_UNIT_FILE,
 )
 from .prompts import confirm_overwrite
-from .services import load_services, save_services
+from .services import Service, load_services, save_services
 from .systemd_unit import render as render_systemd_unit
 
 
@@ -73,20 +73,40 @@ def _resolve(value: str | None, fallback: Callable[[], str | None], error: str) 
     return resolved
 
 
-def _parse_services(pairs: tuple[str, ...]) -> dict[str, str]:
-    services: dict[str, str] = {}
+def _parse_services(pairs: tuple[str, ...]) -> dict[str, Service]:
+    services: dict[str, Service] = {}
     for pair in pairs:
-        name, sep, target = pair.partition("=")
+        name, sep, rest = pair.partition("=")
         if not sep or not name:
             raise click.BadParameter(
-                f"invalid --service {pair!r}; expected NAME=HOST:PORT",
+                f"invalid --service {pair!r}; expected NAME=HOST:PORT"
+                "[/PROTO:REMOTE_PORT]",
                 param_hint="--service",
             )
+        target, proto_sep, proto_spec = rest.partition("/")
         try:
             parse_target(target)
         except ValueError as exc:
             raise click.BadParameter(str(exc), param_hint="--service") from exc
-        services[name] = target
+
+        proto = "http"
+        remote_port: int | None = None
+        if proto_sep:
+            proto, _, remote_port_str = proto_spec.partition(":")
+            if not remote_port_str.isdigit():
+                raise click.BadParameter(
+                    f"invalid --service {pair!r}; expected NAME=HOST:PORT"
+                    "[/PROTO:REMOTE_PORT]",
+                    param_hint="--service",
+                )
+            remote_port = int(remote_port_str)
+
+        try:
+            services[name] = Service(
+                target=target, proto=proto, remote_port=remote_port
+            )
+        except ValueError as exc:
+            raise click.BadParameter(str(exc), param_hint="--service") from exc
     return services
 
 
@@ -98,7 +118,7 @@ def _resolve_config(
     token_param: str,
     region: str | None,
     services: tuple[str, ...],
-) -> tuple[FrpcConfig, dict[str, str]]:
+) -> tuple[FrpcConfig, dict[str, Service]]:
     infra_config = _load_infra_config()
 
     resolved_region = _resolve(
@@ -137,7 +157,7 @@ def _resolve_config(
     return config, _parse_services(services)
 
 
-def _write_frpc_toml(config: FrpcConfig, services: dict[str, str]) -> None:
+def _write_frpc_toml(config: FrpcConfig, services: dict[str, Service]) -> None:
     FRPC_TOML_FILE.parent.mkdir(parents=True, exist_ok=True)
     FRPC_TOML_FILE.write_text(render_frpc_toml(config, services))
     FRPC_TOML_FILE.chmod(0o600)
@@ -155,7 +175,7 @@ def _load_config() -> FrpcConfig:
     return FrpcConfig.load(FRPC_CONFIG_FILE)
 
 
-def _apply_services(cfg: FrpcConfig, services: dict[str, str]) -> None:
+def _apply_services(cfg: FrpcConfig, services: dict[str, Service]) -> None:
     save_services(services, SERVICES_FILE)
     _write_frpc_toml(cfg, services)
     _systemctl("restart", "frpc.service")
@@ -193,8 +213,10 @@ def _common_options(f: Callable[..., Any]) -> Callable[..., Any]:
         "--service",
         "services",
         multiple=True,
-        metavar="NAME=HOST:PORT",
-        help="Expose a local HOST:PORT at NAME.<base-domain>. Repeatable.",
+        metavar="NAME=HOST:PORT[/PROTO:REMOTE_PORT]",
+        help="Expose a local HOST:PORT at NAME.<base-domain> (http, default), or "
+        "as an explicit PROTO (tcp/udp) proxy bound to REMOTE_PORT on the frps "
+        "server. Repeatable.",
     )(f)
     return f
 
@@ -272,17 +294,37 @@ def config(
 @frpc.command()
 @click.argument("name")
 @click.argument("target")
-def add(name: str, target: str) -> None:
-    """Expose a local TARGET (host:port) at NAME.<base-domain>."""
+@click.option(
+    "--proto",
+    type=click.Choice(["http", "tcp", "udp"]),
+    default="http",
+    show_default=True,
+    help="Proxy type. tcp/udp require --remote-port instead of a subdomain.",
+)
+@click.option(
+    "--remote-port",
+    type=int,
+    default=None,
+    help="Public port to bind on the frps server. Required for --proto tcp/udp.",
+)
+def add(name: str, target: str, proto: str, remote_port: int | None) -> None:
+    """Expose a local TARGET (host:port) at NAME.<base-domain>, or on --remote-port."""
     try:
         parse_target(target)
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="TARGET") from exc
+    try:
+        service = Service(target=target, proto=proto, remote_port=remote_port)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--remote-port") from exc
     cfg = _load_config()
     services = load_services(SERVICES_FILE)
-    services[name] = target
+    services[name] = service
     _apply_services(cfg, services)
-    click.echo(f"{name}.{cfg.base_domain} -> {target}")
+    if proto == "http":
+        click.echo(f"{name}.{cfg.base_domain} -> {target}")
+    else:
+        click.echo(f"{cfg.server_addr}:{remote_port} ({proto}) -> {target}")
 
 
 @frpc.command(name="del")
@@ -306,8 +348,14 @@ def list_services() -> None:
     if not services:
         click.echo("no services configured")
         return
-    for name, target in sorted(services.items()):
-        click.echo(f"{name}.{cfg.base_domain} -> {target}")
+    for name, service in sorted(services.items()):
+        if service.proto == "http":
+            click.echo(f"{name}.{cfg.base_domain} -> {service.target}")
+        else:
+            click.echo(
+                f"{cfg.server_addr}:{service.remote_port} "
+                f"({service.proto}) -> {service.target}"
+            )
 
 
 @frpc.command()

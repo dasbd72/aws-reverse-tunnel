@@ -209,6 +209,64 @@ class TestConfig:
         assert result.exit_code == 0, result.output
         assert _saved_config(infra_cli.INFRA_CONFIG_FILE).domain == "new.com"
 
+    def test_saves_extra_port_range_when_given(self, isolated_paths: Path) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            [
+                "config",
+                "--domain",
+                "dasbd72.com",
+                "--region",
+                "us-east-1",
+                "--extra-port-range",
+                "20000-20100",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        config = _saved_config(infra_cli.INFRA_CONFIG_FILE)
+        assert config.extra_port_range_start == 20000
+        assert config.extra_port_range_end == 20100
+
+    def test_extra_port_range_defaults_to_unset(self, isolated_paths: Path) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "dasbd72.com", "--region", "us-east-1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        config = _saved_config(infra_cli.INFRA_CONFIG_FILE)
+        assert config.extra_port_range_start is None
+        assert config.extra_port_range_end is None
+
+    @pytest.mark.parametrize(
+        "bad_range", ["garbage", "20100-20000", "0-100", "100-99999"]
+    )
+    def test_rejects_malformed_extra_port_range(
+        self, isolated_paths: Path, bad_range: str
+    ) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            [
+                "config",
+                "--domain",
+                "dasbd72.com",
+                "--region",
+                "us-east-1",
+                "--extra-port-range",
+                bad_range,
+            ],
+        )
+
+        assert result.exit_code != 0
+        assert "--extra-port-range" in result.output
+
     def test_no_prompt_when_values_unchanged(self, isolated_paths: Path) -> None:
         InfraConfig(
             domain="dasbd72.com", hosted_zone_id="Z123", region="us-east-1"
@@ -260,6 +318,37 @@ class TestDeployDestroyDiff:
         assert "hostedZoneId=Z123" in call["args"]
         assert "region=ap-northeast-1" in call["args"]
         assert call["args"][-1] == "deploy"
+
+    def test_deploy_passes_extra_port_range_context_when_configured(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        InfraConfig(
+            domain="dasbd72.com",
+            hosted_zone_id="Z123",
+            region="ap-northeast-1",
+            extra_port_range_start=20000,
+            extra_port_range_end=20100,
+        ).save(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["deploy"])
+
+        assert result.exit_code == 0, result.output
+        call_args = fake_collaborators["subprocess_calls"][0]["args"]
+        assert "extraPortRangeStart=20000" in call_args
+        assert "extraPortRangeEnd=20100" in call_args
+
+    def test_deploy_omits_extra_port_range_context_when_unconfigured(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["deploy"])
+
+        assert result.exit_code == 0, result.output
+        call_args = " ".join(fake_collaborators["subprocess_calls"][0]["args"])
+        assert "extraPortRange" not in call_args
 
     def test_deploy_fails_cleanly_when_cdk_subprocess_fails(
         self,

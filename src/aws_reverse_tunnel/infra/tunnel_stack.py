@@ -31,6 +31,7 @@ class TunnelStack(Stack):
         token_param_name: str = "/reverse-tunnel/frp-token",
         frp_version: str = "0.71.0",
         caddy_version: str = "2.9.1",
+        extra_port_range: tuple[int, int] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -91,6 +92,18 @@ class TunnelStack(Stack):
         security_group.add_ingress_rule(
             ec2.Peer.any_ipv4(), ec2.Port.tcp(frp_bind_port), "frp control channel"
         )
+        if extra_port_range is not None:
+            start, end = extra_port_range
+            security_group.add_ingress_rule(
+                ec2.Peer.any_ipv4(),
+                ec2.Port.tcp_range(start, end),
+                "extra tcp tunnels (e.g. WireGuard, Sunshine)",
+            )
+            security_group.add_ingress_rule(
+                ec2.Peer.any_ipv4(),
+                ec2.Port.udp_range(start, end),
+                "extra udp tunnels (e.g. WireGuard, Sunshine)",
+            )
 
         role = iam.Role(
             self,
@@ -124,6 +137,13 @@ class TunnelStack(Stack):
             )
         )
 
+        allow_ports = (
+            f"allowPorts = [{{ start = {extra_port_range[0]}, "
+            f"end = {extra_port_range[1]} }}]"
+            if extra_port_range is not None
+            else ""
+        )
+
         user_data = ec2.UserData.for_linux()
         script = _USER_DATA_TEMPLATE.read_text()
         for placeholder, value in {
@@ -134,6 +154,7 @@ class TunnelStack(Stack):
             "__REGION__": self.region,
             "__FRP_VERSION__": frp_version,
             "__CADDY_VERSION__": caddy_version,
+            "__ALLOW_PORTS__": allow_ports,
         }.items():
             script = script.replace(placeholder, value)
         user_data.add_commands(script)

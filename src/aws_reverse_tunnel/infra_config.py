@@ -15,6 +15,8 @@ class InfraConfig:
     domain: str
     hosted_zone_id: str
     region: str
+    extra_port_range_start: int | None = None
+    extra_port_range_end: int | None = None
 
     @classmethod
     def load(cls, path: Path) -> InfraConfig:
