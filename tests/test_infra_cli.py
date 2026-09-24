@@ -1,0 +1,404 @@
+import sys
+from pathlib import Path
+
+import pytest
+from botocore.exceptions import ClientError
+from click.testing import CliRunner
+
+from aws_reverse_tunnel import infra_cli
+from aws_reverse_tunnel.infra_config import InfraConfig
+
+
+@pytest.fixture(autouse=True)
+def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(infra_cli, "INFRA_CONFIG_FILE", tmp_path / "infra-config.json")
+    monkeypatch.setattr(infra_cli, "INFRA_CACHE_DIR", tmp_path / "cache")
+    return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def fake_collaborators(monkeypatch: pytest.MonkeyPatch) -> dict:
+    recorded: dict = {"subprocess_calls": []}
+
+    monkeypatch.setattr(infra_cli.shutil, "which", lambda _name: "/usr/bin/cdk")
+    monkeypatch.setattr(infra_cli.importlib, "import_module", lambda _name: object())
+
+    class FakeRoute53:
+        def list_hosted_zones_by_name(self, DNSName: str, MaxItems: str) -> dict:
+            return {
+                "HostedZones": [
+                    {
+                        "Id": "/hostedzone/Z123",
+                        "Name": f"{DNSName}.",
+                        "Config": {"PrivateZone": False},
+                    }
+                ]
+            }
+
+    class FakeSession:
+        region_name = "ap-northeast-1"
+
+    monkeypatch.setattr(
+        infra_cli.boto3, "client", lambda _service, region_name: FakeRoute53()
+    )
+    monkeypatch.setattr(infra_cli.boto3, "Session", FakeSession)
+
+    def fake_run(args, **kwargs):
+        recorded["subprocess_calls"].append({"args": args, "cwd": kwargs.get("cwd")})
+
+        class Result:
+            returncode = 0
+
+        return Result()
+
+    monkeypatch.setattr(infra_cli.subprocess, "run", fake_run)
+    return recorded
+
+
+def _saved_config(path: Path) -> InfraConfig:
+    return InfraConfig.load(path)
+
+
+class TestConfig:
+    def test_saves_with_explicit_flags(self, isolated_paths: Path) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            [
+                "config",
+                "--domain",
+                "dasbd72.com",
+                "--region",
+                "us-east-1",
+                "--hosted-zone-id",
+                "ZEXPLICIT",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        config = _saved_config(infra_cli.INFRA_CONFIG_FILE)
+        assert config == InfraConfig(
+            domain="dasbd72.com", hosted_zone_id="ZEXPLICIT", region="us-east-1"
+        )
+
+    def test_auto_discovers_hosted_zone_id(self, isolated_paths: Path) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "dasbd72.com", "--region", "us-east-1"],
+        )
+
+        assert result.exit_code == 0, result.output
+        config = _saved_config(infra_cli.INFRA_CONFIG_FILE)
+        assert config.hosted_zone_id == "Z123"
+
+    def test_defaults_region_from_boto3_session(self, isolated_paths: Path) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["config", "--domain", "dasbd72.com"])
+
+        assert result.exit_code == 0, result.output
+        config = _saved_config(infra_cli.INFRA_CONFIG_FILE)
+        assert config.region == "ap-northeast-1"
+
+    def test_errors_when_no_region_available(
+        self, isolated_paths: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class NoRegionSession:
+            region_name = None
+
+        monkeypatch.setattr(infra_cli.boto3, "Session", NoRegionSession)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["config", "--domain", "dasbd72.com"])
+
+        assert result.exit_code != 0
+        assert "--region" in result.output
+        assert not infra_cli.INFRA_CONFIG_FILE.exists()
+
+    def test_errors_when_hosted_zone_not_found(
+        self, isolated_paths: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class EmptyRoute53:
+            def list_hosted_zones_by_name(self, DNSName: str, MaxItems: str) -> dict:
+                return {"HostedZones": []}
+
+        monkeypatch.setattr(
+            infra_cli.boto3, "client", lambda _service, region_name: EmptyRoute53()
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "dasbd72.com", "--region", "us-east-1"],
+        )
+
+        assert result.exit_code != 0
+        assert "--hosted-zone-id" in result.output
+
+    def test_errors_when_hosted_zone_ambiguous(
+        self, isolated_paths: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class AmbiguousRoute53:
+            def list_hosted_zones_by_name(self, DNSName: str, MaxItems: str) -> dict:
+                zone = {
+                    "Id": "/hostedzone/Z1",
+                    "Name": f"{DNSName}.",
+                    "Config": {"PrivateZone": False},
+                }
+                return {"HostedZones": [zone, {**zone, "Id": "/hostedzone/Z2"}]}
+
+        monkeypatch.setattr(
+            infra_cli.boto3, "client", lambda _service, region_name: AmbiguousRoute53()
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "dasbd72.com", "--region", "us-east-1"],
+        )
+
+        assert result.exit_code != 0
+        assert "--hosted-zone-id" in result.output
+
+    def test_prompts_before_overwriting_changed_config(
+        self, isolated_paths: Path
+    ) -> None:
+        InfraConfig(domain="old.com", hosted_zone_id="ZOLD", region="us-east-1").save(
+            infra_cli.INFRA_CONFIG_FILE
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "new.com", "--region", "us-east-1"],
+            input="n\n",
+        )
+
+        assert result.exit_code != 0
+        assert _saved_config(infra_cli.INFRA_CONFIG_FILE).domain == "old.com"
+
+    def test_overwrites_when_confirmed(self, isolated_paths: Path) -> None:
+        InfraConfig(domain="old.com", hosted_zone_id="ZOLD", region="us-east-1").save(
+            infra_cli.INFRA_CONFIG_FILE
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "new.com", "--region", "us-east-1"],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _saved_config(infra_cli.INFRA_CONFIG_FILE).domain == "new.com"
+
+    def test_yes_flag_skips_confirmation(self, isolated_paths: Path) -> None:
+        InfraConfig(domain="old.com", hosted_zone_id="ZOLD", region="us-east-1").save(
+            infra_cli.INFRA_CONFIG_FILE
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "new.com", "--region", "us-east-1", "--yes"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert _saved_config(infra_cli.INFRA_CONFIG_FILE).domain == "new.com"
+
+    def test_no_prompt_when_values_unchanged(self, isolated_paths: Path) -> None:
+        InfraConfig(
+            domain="dasbd72.com", hosted_zone_id="Z123", region="us-east-1"
+        ).save(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(
+            infra_cli.infra,
+            ["config", "--domain", "dasbd72.com", "--region", "us-east-1"],
+        )
+
+        assert result.exit_code == 0, result.output
+
+
+def _seed_config(path: Path) -> InfraConfig:
+    config = InfraConfig(
+        domain="dasbd72.com", hosted_zone_id="Z123", region="ap-northeast-1"
+    )
+    config.save(path)
+    return config
+
+
+class TestDeployDestroyDiff:
+    def test_deploy_requires_prior_config(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["deploy"])
+
+        assert result.exit_code != 0
+        assert "infra config" in result.output
+        assert fake_collaborators["subprocess_calls"] == []
+
+    def test_deploy_uses_saved_config_with_no_flags(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["deploy"])
+
+        assert result.exit_code == 0, result.output
+        call = fake_collaborators["subprocess_calls"][0]
+        assert call["cwd"] == infra_cli.INFRA_CACHE_DIR
+        assert call["args"][0] == "/usr/bin/cdk"
+        assert f"{sys.executable} -m aws_reverse_tunnel.infra.app" in call["args"]
+        assert "domain=dasbd72.com" in call["args"]
+        assert "hostedZoneId=Z123" in call["args"]
+        assert "region=ap-northeast-1" in call["args"]
+        assert call["args"][-1] == "deploy"
+
+    def test_deploy_fails_cleanly_when_cdk_subprocess_fails(
+        self,
+        isolated_paths: Path,
+        fake_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+
+        def failing_run(args, **kwargs):
+            raise infra_cli.subprocess.CalledProcessError(1, args)
+
+        monkeypatch.setattr(infra_cli.subprocess, "run", failing_run)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["deploy"])
+
+        assert result.exit_code != 0
+        assert isinstance(result.exception, SystemExit) or result.exception is None
+        assert "cdk deploy failed" in result.output
+
+    def test_destroy_uses_saved_config(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["destroy"])
+
+        assert result.exit_code == 0, result.output
+        assert fake_collaborators["subprocess_calls"][0]["args"][-1] == "destroy"
+
+    def test_diff_uses_saved_config(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["diff"])
+
+        assert result.exit_code == 0, result.output
+        assert fake_collaborators["subprocess_calls"][0]["args"][-1] == "diff"
+
+
+class TestStatus:
+    def test_requires_prior_config(
+        self, isolated_paths: Path, fake_collaborators: dict
+    ) -> None:
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["status"])
+
+        assert result.exit_code != 0
+        assert "infra config" in result.output
+
+    def test_prints_stack_status_and_outputs(
+        self,
+        isolated_paths: Path,
+        fake_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+
+        class FakeCloudFormation:
+            def describe_stacks(self, StackName: str) -> dict:
+                return {
+                    "Stacks": [
+                        {
+                            "StackStatus": "CREATE_COMPLETE",
+                            "Outputs": [
+                                {"OutputKey": "ElasticIp", "OutputValue": "1.2.3.4"}
+                            ],
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(
+            infra_cli.boto3,
+            "client",
+            lambda _service, region_name: FakeCloudFormation(),
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["status"])
+
+        assert result.exit_code == 0, result.output
+        assert "CREATE_COMPLETE" in result.output
+        assert "ElasticIp: 1.2.3.4" in result.output
+
+    def test_errors_clearly_when_stack_not_found(
+        self,
+        isolated_paths: Path,
+        fake_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+
+        class NotFoundCloudFormation:
+            def describe_stacks(self, StackName: str) -> dict:
+                raise ClientError(
+                    {"Error": {"Code": "ValidationError", "Message": "does not exist"}},
+                    "DescribeStacks",
+                )
+
+        monkeypatch.setattr(
+            infra_cli.boto3,
+            "client",
+            lambda _service, region_name: NotFoundCloudFormation(),
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["status"])
+
+        assert result.exit_code != 0
+        assert "infra deploy" in result.output
+
+    def test_reraises_unexpected_errors_clearly(
+        self,
+        isolated_paths: Path,
+        fake_collaborators: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _seed_config(infra_cli.INFRA_CONFIG_FILE)
+
+        class BrokenCloudFormation:
+            def describe_stacks(self, StackName: str) -> dict:
+                raise ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "nope"}},
+                    "DescribeStacks",
+                )
+
+        monkeypatch.setattr(
+            infra_cli.boto3,
+            "client",
+            lambda _service, region_name: BrokenCloudFormation(),
+        )
+        runner = CliRunner()
+
+        result = runner.invoke(infra_cli.infra, ["status"])
+
+        assert result.exit_code != 0
+        assert "AccessDenied" in result.output or "nope" in result.output

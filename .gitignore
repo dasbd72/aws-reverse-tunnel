@@ -27,7 +27,7 @@
 .LSOverride
 
 # Icon must end with two \r
-Icon
+Icon
 
 # Thumbnails
 ._*
@@ -245,4 +245,12 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,linux,dotenv,macos,python
 
 # Custom rules (everything added below won't be overriden by 'Generate .gitignore File' if you use 'Update' option)
+
+# Claude Code runtime state (not project content)
+.claude/scheduled_tasks.lock
+
+# CDK (real cache lives under $XDG_CACHE_HOME/aws-reverse-tunnel/infra/,
+# outside the repo; these just catch stray local `cdk` invocations from here)
+cdk.out/
+cdk.context.json
 

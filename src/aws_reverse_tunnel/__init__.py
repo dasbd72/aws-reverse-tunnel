@@ -1,2 +1,3 @@
-def main() -> None:
-    print("Hello from aws-reverse-tunnel!")
+from .cli import main
+
+__all__ = ["main"]
